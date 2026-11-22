@@ -9,17 +9,20 @@ import threading
 import httpx
 
 API_URL = os.getenv("SIM_API_URL", "http://127.0.0.1:8000")
-WORKERS = int(os.getenv("SIM_WHALE_WORKERS", "40"))
+WORKERS = int(os.getenv("SIM_WHALE_WORKERS", "8"))
 
 _stop = threading.Event()
 _threads: list[threading.Thread] = []
+_lock = threading.Lock()
 
 
 def _worker() -> None:
-    with httpx.Client(base_url=API_URL, timeout=60) as client:
+    password = os.getenv("ERP_CUSTOMER_PASSWORD")
+    auth = ("customer", password) if password else None
+    with httpx.Client(base_url=API_URL, timeout=5, auth=auth) as client:
         while not _stop.is_set():
             try:
-                client.get("/t/1/reports/monthly", params={"year": 2026})
+                client.get("/t/1/reports/monthly", params={"year": 2026}).raise_for_status()
             except httpx.HTTPError:
                 _stop.wait(0.5)
 
@@ -29,15 +32,19 @@ def running() -> bool:
 
 
 def start() -> None:
-    if running():
-        return
-    _stop.clear()
-    _threads.clear()
-    for _ in range(WORKERS):
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-        _threads.append(t)
+    with _lock:
+        if running():
+            return
+        _stop.clear()
+        _threads.clear()
+        for _ in range(WORKERS):
+            thread = threading.Thread(target=_worker, daemon=True)
+            thread.start()
+            _threads.append(thread)
 
 
 def stop() -> None:
-    _stop.set()
+    with _lock:
+        _stop.set()
+        for thread in _threads:
+            thread.join()

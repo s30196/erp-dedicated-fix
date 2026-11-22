@@ -1,16 +1,8 @@
-"""Load test: small tenants alone vs. small tenants + whale month-end reports.
-
-    python loadtest/loadtest.py --label baseline-shared
-    python loadtest/loadtest.py --label whale-dedicated-db --whale-workers 16
-
-Phase 1 'small_only'  : small tenants do normal work (reads + writes).
-Phase 2 'with_whale'  : same traffic + whale workers hammering the heavy report.
-The number that matters for the go/no-go: p95 of SMALL tenants, phase 1 vs 2.
-Results are also saved to results/<label>.json
-"""
+"""Compare small-tenant latency with and without distributor traffic."""
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import time
@@ -22,12 +14,12 @@ def pct(values, p):
     if not values:
         return None
     s = sorted(values)
-    return round(s[min(len(s) - 1, int(p / 100 * len(s)))], 1)
+    return s[math.ceil(p / 100 * len(s)) - 1]
 
 
-async def small_worker(client, stop_at, lat, errors, n_small):
+async def order_worker(client, stop_at, samples, tenant_ids):
     while time.perf_counter() < stop_at:
-        tid = random.randint(2, n_small + 1)
+        tid = random.choice(tenant_ids)
         t0 = time.perf_counter()
         try:
             if random.random() < 0.8:
@@ -37,47 +29,73 @@ async def small_worker(client, stop_at, lat, errors, n_small):
                     f"/t/{tid}/orders",
                     json={"lines": [{"product": "SKU-1", "qty": 2, "unit_price": "9.99"}]},
                 )
-            ok = r.status_code < 400
+            ok = r.is_success
         except httpx.HTTPError:
             ok = False
-        lat.append((time.perf_counter() - t0) * 1000)
-        if not ok:
-            errors[0] += 1
+        samples.append(((time.perf_counter() - t0) * 1000, ok))
         await asyncio.sleep(random.uniform(0.01, 0.05))  # think time
 
 
-async def whale_worker(client, stop_at, lat, errors):
+async def report_worker(client, stop_at, samples):
     while time.perf_counter() < stop_at:
         t0 = time.perf_counter()
         try:
             r = await client.get("/t/1/reports/monthly", params={"year": 2026})
-            ok = r.status_code < 400
+            ok = r.is_success
         except httpx.HTTPError:
             ok = False
-        lat.append((time.perf_counter() - t0) * 1000)
-        if not ok:
-            errors[0] += 1
+        samples.append(((time.perf_counter() - t0) * 1000, ok))
 
 
-async def run_phase(args, whale_workers):
-    small_lat, whale_lat, small_err, whale_err = [], [], [0], [0]
-    limits = httpx.Limits(max_connections=500)
-    async with httpx.AsyncClient(base_url=args.base_url, timeout=30, limits=limits) as client:
-        stop_at = time.perf_counter() + args.duration
-        tasks = [small_worker(client, stop_at, small_lat, small_err, args.small_tenants)
-                 for _ in range(args.small_workers)]
-        tasks += [whale_worker(client, stop_at, whale_lat, whale_err) for _ in range(whale_workers)]
-        await asyncio.gather(*tasks)
-    summary = lambda lat, err: {
-        "requests": len(lat), "rps": round(len(lat) / args.duration, 1), "errors": err[0],
-        "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95), "p99_ms": pct(lat, 99),
+def summarize(samples, duration):
+    latencies = [ms for ms, _ in samples]
+    return {
+        "requests": len(samples),
+        "rps": round(len(samples) / duration, 1),
+        "errors": sum(not ok for _, ok in samples),
+        "p50_ms": pct(latencies, 50),
+        "p95_ms": pct(latencies, 95),
+        "p97_ms": pct(latencies, 97),
+        "p99_ms": pct(latencies, 99),
+        "within_800ms": sum(ok and ms <= 800 for ms, ok in samples),
     }
-    return {"small": summary(small_lat, small_err), "whale": summary(whale_lat, whale_err)}
+
+
+def customer_auth(variable):
+    password = os.getenv(variable)
+    return ("customer", password) if password else None
+
+
+async def run_phase(args, with_whale):
+    small, normal, reports = [], [], []
+    shared_client = httpx.AsyncClient(base_url=args.base_url, timeout=5, auth=customer_auth("ERP_SHARED_PASSWORD"))
+    whale_client = httpx.AsyncClient(
+        base_url=args.whale_url or args.base_url, timeout=5,
+        auth=customer_auth("ERP_WHALE_PASSWORD" if args.whale_url else "ERP_SHARED_PASSWORD"),
+    )
+    async with shared_client as shared, whale_client as whale:
+        stop_at = time.perf_counter() + args.duration
+        small_ids = range(2, args.small_tenants + 2)
+        tasks = [order_worker(shared, stop_at, small, small_ids)
+                 for _ in range(args.small_workers)]
+        if with_whale:
+            tasks += [order_worker(whale, stop_at, normal, (1,))
+                      for _ in range(args.whale_order_workers)]
+            tasks += [report_worker(whale, stop_at, reports)
+                      for _ in range(args.whale_workers)]
+        await asyncio.gather(*tasks)
+    return {
+        "small": summarize(small, args.duration),
+        "whale_normal": summarize(normal, args.duration),
+        "whale_reports": summarize(reports, args.duration),
+    }
 
 
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://localhost:8000")
+    ap.add_argument("--whale-url", help="dedicated API URL, defaults to the shared URL")
+    ap.add_argument("--whale-order-workers", type=int, default=10)
     ap.add_argument("--duration", type=int, default=20, help="seconds per phase")
     ap.add_argument("--small-workers", type=int, default=10)
     ap.add_argument("--whale-workers", type=int, default=8, help="concurrent whale report runners")
@@ -85,24 +103,41 @@ async def main():
     ap.add_argument("--label", default="run")
     args = ap.parse_args()
 
-    print(f"[{args.label}] phase 1: small tenants only ({args.duration}s)")
-    base = await run_phase(args, 0)
-    print(f"[{args.label}] phase 2: + whale, {args.whale_workers} report workers ({args.duration}s)")
-    with_whale = await run_phase(args, args.whale_workers)
+    for field in ("duration", "small_workers", "whale_workers", "whale_order_workers", "small_tenants"):
+        if getattr(args, field) < 1:
+            ap.error(f"--{field.replace('_', '-')} must be positive")
 
-    result = {"label": args.label, "args": vars(args), "small_only": base, "with_whale": with_whale}
+    print(f"[{args.label}] phase 1: small tenants only ({args.duration}s)")
+    base = await run_phase(args, False)
+    print(f"[{args.label}] phase 2: + whale, {args.whale_workers} report workers ({args.duration}s)")
+    with_whale = await run_phase(args, True)
+
+    baseline = base["small"]
+    loaded = with_whale["small"]
+    normal = with_whale["whale_normal"]
+    degradation = (loaded["p95_ms"] / baseline["p95_ms"] - 1) * 100 if baseline["p95_ms"] else None
+    normal_fraction = normal["within_800ms"] / normal["requests"] if normal["requests"] else 0
+    checks = {
+        "whale_normal_at_least_97_percent_within_800ms": normal_fraction >= 0.97,
+        "small_p95_increase_at_most_10_percent": (
+            degradation is not None and degradation <= 10
+            and loaded["errors"] == baseline["errors"] == 0
+        ),
+        "whale_reports_successful": (
+            with_whale["whale_reports"]["requests"] > 0 and with_whale["whale_reports"]["errors"] == 0
+        ),
+    }
+    result = {
+        "label": args.label, "args": vars(args), "small_only": base, "with_whale": with_whale,
+        "small_p95_change_percent": degradation, "whale_normal_fraction_within_800ms": normal_fraction,
+        "checks": checks,
+    }
     os.makedirs("results", exist_ok=True)
     with open(f"results/{args.label}.json", "w") as f:
         json.dump(result, f, indent=2)
-
-    print(f"\n{'':<22}{'rps':>8}{'p50 ms':>10}{'p95 ms':>10}{'p99 ms':>10}{'errors':>8}")
-    for name, r in (("small, no whale", base["small"]), ("small, with whale", with_whale["small"]),
-                    ("whale reports", with_whale["whale"])):
-        print(f"{name:<22}{r['rps']:>8}{r['p50_ms']!s:>10}{r['p95_ms']!s:>10}{r['p99_ms']!s:>10}{r['errors']:>8}")
-    b, w = base["small"]["p95_ms"], with_whale["small"]["p95_ms"]
-    if b and w:
-        print(f"\nSmall-tenant p95 degradation caused by the whale: x{w / b:.1f}")
+    print(json.dumps(result, indent=2))
+    return 0 if all(checks.values()) else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

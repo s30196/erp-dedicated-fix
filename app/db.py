@@ -1,12 +1,4 @@
-"""Database access layer.
-
-SPIKE HOOK #1 - tenant routing.
-Every request obtains its connection through `tenant_conn(tenant_id)`.
-Today all tenants share one pool and one database. To test a dedicated
-database for a tenant, set TENANT_DSN_MAP (see README) - the routing is
-already here, you only have to provide the second database.
-"""
-import json
+"""Database access for a single ERP environment."""
 import os
 import threading
 from contextlib import contextmanager
@@ -18,8 +10,18 @@ DEFAULT_DSN = os.getenv("DATABASE_URL", "postgresql://erp:erp@localhost:5432/erp
 POOL_MAX = int(os.getenv("POOL_MAX", "10"))
 POOL_TIMEOUT = float(os.getenv("POOL_TIMEOUT", "10"))  # seconds to wait for a free connection
 
-# e.g. TENANT_DSN_MAP='{"1": "postgresql://erp:erp@db_whale:5432/erp"}'
-TENANT_DSN_MAP = {int(k): v for k, v in json.loads(os.getenv("TENANT_DSN_MAP", "{}")).items()}
+SCOPE = os.getenv("ERP_SCOPE", "demo")
+if SCOPE not in {"demo", "shared", "dedicated"}:
+    raise ValueError("ERP_SCOPE must be demo, shared or dedicated")
+
+
+def serves_tenant(tenant_id: int) -> bool:
+    if SCOPE == "shared":
+        return tenant_id > 1
+    if SCOPE == "dedicated":
+        return tenant_id == 1
+    return tenant_id >= 1
+
 
 _pools: dict[str, ConnectionPool] = {}
 _lock = threading.Lock()
@@ -39,23 +41,28 @@ def _pool_for(dsn: str) -> ConnectionPool:
         return _pools[dsn]
 
 
-def dsn_for(tenant_id: int) -> str:
-    return TENANT_DSN_MAP.get(tenant_id, DEFAULT_DSN)
+@contextmanager
+def connection():
+    with _pool_for(DEFAULT_DSN).connection() as conn:
+        yield conn
 
 
 @contextmanager
 def tenant_conn(tenant_id: int):
-    """Yield a connection for this tenant (commits on exit)."""
-    with _pool_for(dsn_for(tenant_id)).connection() as conn:
+    if not serves_tenant(tenant_id):
+        raise ValueError("tenant is outside this ERP environment")
+    with connection() as conn:
         yield conn
 
 
 def pool_stats() -> dict:
     """Pool pressure per database - 'requests_waiting' > 0 means queueing."""
     out = {}
-    for dsn, pool in _pools.items():
+    with _lock:
+        pools = list(_pools.values())
+    for pool in pools:
         s = pool.get_stats()
-        label = dsn.split("@")[-1]  # hide credentials
+        label = SCOPE
         out[label] = {
             "pool_size": s.get("pool_size"),
             "pool_available": s.get("pool_available"),

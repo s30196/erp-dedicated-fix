@@ -1,22 +1,66 @@
-"""Mini-ERP, multi-tenant, shared stack. Deliberately simple: a base for spikes.
-
-Tenant comes from the URL (/t/{tenant_id}/...) to keep the code readable.
-In a real system it would come from the auth token, never from the client.
-"""
+"""Mini-ERP demo for shared and dedicated tenant environments."""
+import asyncio
+import os
+import secrets
 import time
+from contextlib import asynccontextmanager
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from psycopg_pool import PoolTimeout
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from . import db, guardrail, simulation, whale
 
-app = FastAPI(title="Mini-ERP multi-tenant base (spike starter)")
+CUSTOMER_PASSWORD = os.getenv("ERP_CUSTOMER_PASSWORD", "")
+OPS_PASSWORD = os.getenv("ERP_OPS_PASSWORD", "")
+basic = HTTPBasic(auto_error=False)
+
+
+def require_access(request: Request, credentials: HTTPBasicCredentials = Depends(basic)):
+    if db.SCOPE == "demo" or request.url.path in {"/health", "/ready"}:
+        return
+    path = request.url.path
+    operator_route = path == "/ops" or path.startswith("/admin/")
+    if credentials:
+        if credentials.username == "ops":
+            expected = OPS_PASSWORD
+        elif credentials.username == "customer" and not operator_route:
+            expected = CUSTOMER_PASSWORD
+        else:
+            expected = ""
+        if expected and secrets.compare_digest(credentials.password.encode(), expected.encode()):
+            return
+    raise HTTPException(
+        status_code=401,
+        detail="credentials required for this environment",
+        headers={"WWW-Authenticate": f'Basic realm="ERP {db.SCOPE}"'},
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pending_reports = 0
+    app.state.report_lock = asyncio.Lock()
+    app.state.next_report_at = 0.0
+    yield
+
+
+app = FastAPI(
+    lifespan=lifespan,
+    title="Mini-ERP",
+    dependencies=[Depends(require_access)],
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 @app.middleware("http")
@@ -48,15 +92,21 @@ def page_client():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+def require_whale_environment():
+    if not db.serves_tenant(guardrail.WHALE_ID):
+        raise HTTPException(status_code=404, detail="whale operations unavailable")
+
+
 @app.get("/ops", include_in_schema=False)
-def page_ops():
+def page_ops(_: None = Depends(require_whale_environment)):
     return FileResponse(STATIC_DIR / "ops.html")
 
 
 @app.get("/api/tenants")
-def list_tenants():
-    """Tenant list for the UI dropdown: the whale plus the first small tenants."""
-    with db.tenant_conn(guardrail.WHALE_ID) as conn:
+def list_tenants(response: Response):
+    """Tenant list for the UI dropdown in this environment."""
+    response.headers["X-ERP-Scope"] = db.SCOPE
+    with db.connection() as conn:
         return conn.execute(
             "SELECT id, name, plan FROM tenants WHERE id <= 20 ORDER BY id"
         ).fetchall()
@@ -64,11 +114,23 @@ def list_tenants():
 
 @app.get("/health")
 def health():
+    """Process liveness."""
+    return {"ok": True}
+
+
+@app.get("/ready")
+def readiness():
+    """Check that the configured database and tenant table are reachable."""
+    try:
+        with db.connection() as conn:
+            conn.execute("SELECT 1 FROM tenants LIMIT 1")
+    except (psycopg.Error, PoolTimeout):
+        raise HTTPException(status_code=503, detail="database unavailable")
     return {"ok": True}
 
 
 @app.get("/t/{tenant_id}/orders")
-def list_orders(tenant_id: int = Depends(guardrail.check), limit: int = Query(50, le=500)):
+def list_orders(tenant_id: int = Depends(guardrail.check), limit: int = Query(50, ge=1, le=500)):
     """Light, OLTP-style query: what small tenants do all day."""
     with db.tenant_conn(tenant_id) as conn:
         return conn.execute(
@@ -98,9 +160,34 @@ def create_order(order: OrderIn, tenant_id: int = Depends(guardrail.check)):
     return {"id": row["id"], "total": total}
 
 
+REPORT_INTERVAL = float(os.getenv("ERP_REPORT_INTERVAL_SECONDS", "0.15"))
+REPORT_QUEUE_SIZE = int(os.getenv("ERP_REPORT_QUEUE_SIZE", "24"))
+if not 0 < REPORT_INTERVAL <= 1 or not 1 <= REPORT_QUEUE_SIZE <= 40:
+    raise ValueError("Invalid dedicated report interval or queue size")
+
+
 @app.get("/t/{tenant_id}/reports/monthly")
-def monthly_report(tenant_id: int = Depends(guardrail.check), year: int = 2026):
-    """Heavy, OLAP-style query: the month-end report that slowed everyone down."""
+async def monthly_report(
+    request: Request, tenant_id: int = Depends(guardrail.check),
+    year: int = Query(2026, ge=1, le=9998),
+):
+    if db.SCOPE != "dedicated":
+        return await run_in_threadpool(query_monthly_report, tenant_id, year)
+
+    state = request.app.state
+    if state.pending_reports >= REPORT_QUEUE_SIZE:
+        raise HTTPException(429, "month-end report queue is full", headers={"Retry-After": "1"})
+    state.pending_reports += 1
+    try:
+        async with state.report_lock:
+            await asyncio.sleep(max(0, state.next_report_at - time.monotonic()))
+            state.next_report_at = time.monotonic() + REPORT_INTERVAL
+            return await run_in_threadpool(query_monthly_report, tenant_id, year)
+    finally:
+        state.pending_reports -= 1
+
+
+def query_monthly_report(tenant_id: int, year: int):
     with db.tenant_conn(tenant_id) as conn:
         return conn.execute(
             """
@@ -132,34 +219,34 @@ def metrics_reset():
 
 
 @app.get("/admin/whale")
-def whale_status():
+def whale_status(_: None = Depends(require_whale_environment)):
     return whale.status()
 
 
 @app.post("/admin/whale/remove")
-def whale_remove():
+def whale_remove(_: None = Depends(require_whale_environment)):
     whale.remove()
     return whale.status()
 
 
 @app.post("/admin/whale/add")
-def whale_add():
+def whale_add(_: None = Depends(require_whale_environment)):
     whale.add()
     return whale.status()
 
 
 @app.get("/admin/simulation")
-def simulation_status():
+def simulation_status(_: None = Depends(require_whale_environment)):
     return {"running": simulation.running()}
 
 
 @app.post("/admin/simulation/start")
-def simulation_start():
+def simulation_start(_: None = Depends(require_whale_environment)):
     simulation.start()
     return {"running": simulation.running()}
 
 
 @app.post("/admin/simulation/stop")
-def simulation_stop():
+def simulation_stop(_: None = Depends(require_whale_environment)):
     simulation.stop()
     return {"running": False}

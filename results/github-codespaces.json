@@ -1,0 +1,84 @@
+{
+  "label": "github-codespaces",
+  "args": {
+    "base_url": "http://127.0.0.1:8000",
+    "whale_url": "http://127.0.0.1:8001",
+    "whale_order_workers": 10,
+    "duration": 30,
+    "small_workers": 10,
+    "whale_workers": 8,
+    "small_tenants": 300,
+    "label": "github-codespaces"
+  },
+  "small_only": {
+    "small": {
+      "requests": 7915,
+      "rps": 263.8,
+      "errors": 0,
+      "p50_ms": 4.947310000034122,
+      "p95_ms": 18.02170999997088,
+      "p97_ms": 22.821055000008528,
+      "p99_ms": 33.13756100010323,
+      "within_800ms": 7915
+    },
+    "whale_normal": {
+      "requests": 0,
+      "rps": 0.0,
+      "errors": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p97_ms": null,
+      "p99_ms": null,
+      "within_800ms": 0
+    },
+    "whale_reports": {
+      "requests": 0,
+      "rps": 0.0,
+      "errors": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "p97_ms": null,
+      "p99_ms": null,
+      "within_800ms": 0
+    }
+  },
+  "with_whale": {
+    "small": {
+      "requests": 3331,
+      "rps": 111.0,
+      "errors": 0,
+      "p50_ms": 26.965119000010418,
+      "p95_ms": 171.7035089999399,
+      "p97_ms": 212.215786999991,
+      "p99_ms": 301.1702090000199,
+      "within_800ms": 3331
+    },
+    "whale_normal": {
+      "requests": 3000,
+      "rps": 100.0,
+      "errors": 0,
+      "p50_ms": 34.77364800005489,
+      "p95_ms": 184.68291299996054,
+      "p97_ms": 229.94238700005099,
+      "p99_ms": 327.3448319999943,
+      "within_800ms": 3000
+    },
+    "whale_reports": {
+      "requests": 113,
+      "rps": 3.8,
+      "errors": 0,
+      "p50_ms": 2036.5463890000228,
+      "p95_ms": 3191.2475649999124,
+      "p97_ms": 3246.492017000037,
+      "p99_ms": 3341.7371319999347,
+      "within_800ms": 3
+    }
+  },
+  "small_p95_change_percent": 852.7592498171225,
+  "whale_normal_fraction_within_800ms": 1.0,
+  "checks": {
+    "whale_normal_at_least_97_percent_within_800ms": true,
+    "small_p95_increase_at_most_10_percent": false,
+    "whale_reports_successful": true
+  }
+}

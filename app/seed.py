@@ -4,14 +4,15 @@
 
 Sizes (env): SMALL_TENANTS=300  SMALL_ORDERS=300  WHALE_ORDERS=31500
 Defaults make the whale add ~35% to the database, as in the load test from the
-exercise. Raise WHALE_ORDERS to make the whale heavier. Safe to re-run (truncates).
+exercise. Raise WHALE_ORDERS to make the whale heavier. Initializes an empty demo database.
 """
 import os
 import time
 
 import psycopg
 
-DSN = os.getenv("DATABASE_URL", "postgresql://erp:erp@localhost:5432/erp")
+from .db import DEFAULT_DSN, SCOPE
+
 SMALL_TENANTS = int(os.getenv("SMALL_TENANTS", "300"))
 SMALL_ORDERS = int(os.getenv("SMALL_ORDERS", "300"))
 WHALE_ORDERS = int(os.getenv("WHALE_ORDERS", "31500"))
@@ -19,14 +20,19 @@ WHALE_ORDERS = int(os.getenv("WHALE_ORDERS", "31500"))
 
 def main() -> None:
     t0 = time.time()
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute("TRUNCATE order_lines, orders, tenants RESTART IDENTITY CASCADE")
-        conn.execute("INSERT INTO tenants (id, name, plan) VALUES (1, 'Whale Distribution', 'enterprise')")
-        conn.execute(
-            "INSERT INTO tenants (id, name, plan) "
-            "SELECT g, 'Small Co ' || g, 'small' FROM generate_series(2, %s) g",
-            (SMALL_TENANTS + 1,),
-        )
+    with psycopg.connect(DEFAULT_DSN) as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(1)")
+        if conn.execute("SELECT 1 FROM tenants LIMIT 1").fetchone():
+            print("Database already has tenants. Seed skipped.")
+            return
+        if SCOPE != "shared":
+            conn.execute("INSERT INTO tenants (id, name, plan) VALUES (1, 'Whale Distribution', 'enterprise')")
+        if SCOPE != "dedicated":
+            conn.execute(
+                "INSERT INTO tenants (id, name, plan) "
+                "SELECT g, 'Small Co ' || g, 'small' FROM generate_series(2, %s) g",
+                (SMALL_TENANTS + 1,),
+            )
         conn.execute(
             """
             INSERT INTO orders (tenant_id, order_date, status)
@@ -63,7 +69,7 @@ def main() -> None:
             "       (SELECT count(*) FROM orders WHERE tenant_id <> 1) AS so"
         ).fetchone()
     print(f"Seeded in {time.time() - t0:.1f}s | db size {size} | "
-          f"whale orders {w[0]} vs small-tenant orders {w[1]} ({w[0] / w[1]:.0%} extra)")
+          f"whale orders {w[0]} vs small-tenant orders {w[1]}")
 
 
 if __name__ == "__main__":

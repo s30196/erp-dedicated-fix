@@ -26,11 +26,18 @@ window.addEventListener("error", (e) => crash(e.message));
 function tenantId() { return $("tenant").value; }
 
 async function loadTenants() {
-  const tenants = await (await api("/api/tenants")).json();
+  const response = await api("/api/tenants");
+  const tenants = await response.json();
+  $("ops-link").hidden = response.headers.get("X-ERP-Scope") === "shared";
   $("tenant").innerHTML = tenants
     .map((t) => `<option value="${t.id}" data-plan="${t.plan}">${t.id} - ${t.name}</option>`)
     .join("");
-  $("tenant").value = 5;
+  if (tenants.some((tenant) => tenant.id === 5)) $("tenant").value = 5;
+  if (!tenants.length) {
+    $("orders-msg").textContent = "No tenants are available.";
+    $("add").disabled = $("report").disabled = true;
+    return;
+  }
   showPlan();
   loadOrders();
 }
@@ -68,14 +75,26 @@ async function runReport() {
   $("report-msg").textContent = "Calculating...";
   $("report-rows").innerHTML = "";
   const t0 = performance.now();
-  const r = await api(`/t/${tenantId()}/reports/monthly`);
-  const ms = Math.round(performance.now() - t0);
-  const rows = await r.json();
-  $("report-msg").textContent = `Done in ${ms} ms (${rows.length} rows, showing 10)`;
-  $("report-rows").innerHTML = rows.slice(0, 10)
-    .map((x) => `<tr><td>${x.month}</td><td>${x.product}</td><td class="num">${money(x.revenue)}</td></tr>`)
-    .join("");
-  $("report").disabled = false;
+  try {
+    const r = await api(`/t/${tenantId()}/reports/monthly`);
+    if (r.status === 429) {
+      $("report-msg").textContent = "The report queue is full. Try again shortly.";
+      return;
+    }
+    if (!r.ok) throw new Error(`Report request failed (${r.status})`);
+    const ms = Math.round(performance.now() - t0);
+    const rows = await r.json();
+    $("report-msg").textContent = `Done in ${ms} ms (${rows.length} rows, showing 10)`;
+    $("report-rows").innerHTML = rows.slice(0, 10)
+      .map((x) => `<tr><td>${x.month}</td><td>${x.product}</td><td class="num">${money(x.revenue)}</td></tr>`)
+      .join("");
+  } catch (error) {
+    $("report-msg").textContent = error.name === "TimeoutError"
+      ? "The report took too long. Try again shortly."
+      : "The report is unavailable. Try again shortly.";
+  } finally {
+    $("report").disabled = false;
+  }
 }
 
 $("tenant").addEventListener("change", () => { showPlan(); loadOrders(); $("report-rows").innerHTML = ""; $("report-msg").textContent = ""; });

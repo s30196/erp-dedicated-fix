@@ -1,7 +1,7 @@
 {
   "name": "ERP dedicated test",
   "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql && python -m pip install -r requirements.txt",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql && python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt",
   "forwardPorts": [
     8000,
     8001

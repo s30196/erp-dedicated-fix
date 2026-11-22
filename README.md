@@ -22,67 +22,65 @@ about 8 times today's peak load, and the database grew by 35%. Worst of all, the
 Sales needs a go / no-go decision within a week. The question for the exercise:
 **can we take on the whale without hurting our 300 small customers, and what would it cost?**
 
-## What the application shows
+## Run and test in GitHub Codespaces
 
-The application has two pages.
+On the `dedicated-erp` branch, open **Code → Codespaces** and create a Codespace. Wait for setup to install PostgreSQL and the Python dependencies. In its terminal run `bash codespaces-verify.sh`.
 
-**Customer** (the main page). This is what one customer sees: their latest orders, a form
-for a new order, and a button that creates the monthly report. The label *System speed* in
-the top bar shows how long the last action took (green is fast, red is slow).
+The script seeds two disposable PostgreSQL clusters, launches two API processes, checks tenant access, runs the queue tests, and compares normal traffic with a month-end report burst. It writes `results/github-codespaces.json` and stops its processes. Set `ERP_TEST_PHASE_SECONDS` to change the phase duration.
 
-**Operations.** A control panel for setting up the situation:
+For the interactive demo, run `bash codespaces-verify.sh --serve`. Open ports 8000 (shared) and 8001 (distributor) from **Ports**. Keep both private. Use username `customer` and password `shared-fixture` or `dedicated-fixture` respectively. For distributor Operations at `/ops`, use `ops` and `dedicated-ops-fixture`. Stop the command with Ctrl+C and stop the Codespace when finished.
 
-- **Remove whale / Add whale** takes the big customer out of the system or puts them back.
-- **Simulate month-end** makes the whale's finance team run their monthly reports all at
-  once, as they would on the last day of the month.
+The script pins each API and its PostgreSQL cluster to a separate logical CPU using taskset. It needs at least two available logical CPUs. The demo uses synthetic data and the stacks still share one cloud host. Separate-host staging with the real workload is required before signing an SLA.
 
-### Try it yourself
+## Codespaces test evidence
 
-1. Open the **Customer** page and click around as a small customer. Everything is fast.
-2. Open **Operations** and click **Simulate month-end**.
-3. Go back to the **Customer** page and try again. The system is now slow, and after a few
-   seconds the page stops working. This is what the small customers would experience.
-4. On **Operations**, click **Remove whale**. Now the small customer's page works again,
-   even though the simulation is still running.
-5. Click **Add whale** (it takes about 15 seconds) and **Stop simulation** to restore everything.
+The two cloud runs passed the tenant smoke checks, both report-queue unit tests, and the 800 ms target for normal distributor requests. The 10% small-tenant p95 gate failed on the two-CPU Codespace, both with shared CPU scheduling (34.02 to 93.61 ms) and with each stack pinned to a CPU (18.02 to 171.70 ms). Raw results are in `results/github-codespaces-shared-cpu.json` and `results/github-codespaces.json`. The same-host result cannot confirm the separate-host acceptance criterion.
 
-This is the problem you are asked to solve.
+## Month-end report protection
 
-## How to run it
+The distributor API queues at most 24 report requests per process, including the
+one running. It runs one report query at a time and waits at least 150 ms
+between query starts. Waiting requests do not take a PostgreSQL connection or a
+worker thread. When the queue is full, the API returns HTTP 429 with
+`Retry-After: 1` and the customer page prompts the user to retry. Queued reports
+still query live data when they run. Order reads and writes bypass the queue.
+The Operations simulation defaults to eight report clients.
 
-The easiest way is in your web browser. You do not need to install anything.
+`ERP_REPORT_QUEUE_SIZE` and `ERP_REPORT_INTERVAL_SECONDS` set the bounds.
+The default interval permits up to about 6.7 report starts per second per
+process. Tune the bounds against the expected report volume and report wait
+times. A staging deployment with multiple API replicas must account for the
+sum of their report budgets. The load test records rejected reports as errors.
+Run the queue regression test with `python -m unittest discover -s tests -v`.
 
-1. Log in to GitHub and open this repository.
-2. Choose your own branch from the branch list at the top left of the repository page.
-3. Click the green **Code** button, open the **Codespaces** tab and choose
-   **Create codespace on** your branch.
-4. Wait a few minutes. The first start builds the application and loads the data.
-   When it is ready, a browser tab with the application opens on its own.
-5. If it did not open, find the **Ports** tab at the bottom of the screen and click the
-   globe icon next to port **8000**.
+## Separate-host staging
 
-Notes:
+Run each API and its PostgreSQL instance on a separate authorized host, with independent storage and credentials. Run the load generator from a third host with observed peak traffic.
 
-- A Codespace uses your free monthly hours. When you finish, stop it
-  (github.com/codespaces, then **Stop codespace**). It also stops by itself after 30
-  minutes without activity.
-- Pages: the main page is the address of port 8000, and **Operations** is the same address
-  followed by `/ops`.
+## Availability assessment
 
-### Running on your own computer (optional)
+This demo has one API process and one database instance per environment. Use
+`/health` for process liveness and `/ready` for database readiness. The 99.9%
+target allows 43.2 minutes of unavailability in a 30-day month.
 
-If you have Docker Desktop installed and running, open a terminal in the project folder and run:
+- Size the distributor environment on dedicated capacity. Put at least two API
+  replicas behind a health-checked load balancer across availability zones, with
+  rolling releases and a tested rollback. Use managed PostgreSQL with
+  multi-zone failover, automated backups and point-in-time recovery.
+- Probe a representative authenticated order transaction externally every
+  minute and track unavailable minutes. Alert the on-call operator on failed
+  probes, elevated error rates, saturation, replication lag and backup failure.
+  Track maintenance against the budget unless the contract expressly excludes it.
+- Before committing, exercise API loss, database failover and restoration using
+  production-like data. Target under five minutes for automatic failover and
+  verify recovery point and restore time with an actual restore. Agree on the
+  data-loss target with the customer and document how a prolonged outage would
+  affect the monthly budget. Run repeatable peak-load and month-end tests on
+  separate hosts at the expected 1,200-user traffic mix and data volume.
+- Obtain quotes for dedicated compute, database HA, backups, monitoring and
+  on-call operations. The repository cost model illustrates €4,300 per month
+  for the dedicated option and €1,700 per month in contribution at €6,000.
+  These figures are assumptions that need pricing and operating validation.
 
-```bash
-docker compose up -d --build
-```
-
-```bash
-docker compose run --rm api python -m app.seed
-```
-
-Then open <http://localhost:8000> in your browser. To switch it off:
-
-```bash
-docker compose down
-```
+Proceed with the assessment. Make the contract decision after validating tenant
+authorization, load isolation, recovery and cost in representative staging.
