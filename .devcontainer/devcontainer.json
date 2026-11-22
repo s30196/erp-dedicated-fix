@@ -1,13 +1,9 @@
 {
-  "name": "erp-spike",
+  "name": "ERP dedicated test",
   "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
-  "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false }
-  },
-  "hostRequirements": { "cpus": 4 },
-  "postCreateCommand": "pip install httpx && docker compose up -d --build && docker compose run --rm api python -m app.seed",
-  "forwardPorts": [8000],
-  "portsAttributes": {
-    "8000": { "label": "Mini-ERP", "onAutoForward": "openBrowser" }
-  }
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y postgresql && python -m pip install -r requirements.txt",
+  "forwardPorts": [
+    8000,
+    8001
+  ]
 }
