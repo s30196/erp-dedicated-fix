@@ -36,6 +36,8 @@ The script pins each API and its PostgreSQL cluster to a separate logical CPU us
 
 The two cloud runs passed the tenant smoke checks, both report-queue unit tests, and the 800 ms target for normal distributor requests. The 10% small-tenant p95 gate failed on the two-CPU Codespace, both with shared CPU scheduling (34.02 to 93.61 ms) and with each stack pinned to a CPU (18.02 to 171.70 ms). Raw results are in `results/github-codespaces-shared-cpu.json` and `results/github-codespaces.json`. The same-host result cannot confirm the separate-host acceptance criterion.
 
+The interactive smoke test also verified both Customer pages and distributor Operations. The simulation started and stopped, and a shared order read and distributor report succeeded while it ran.
+
 ## Month-end report protection
 
 The distributor API queues at most 24 report requests per process, including the
